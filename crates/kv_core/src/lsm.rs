@@ -1,13 +1,15 @@
 //! Crash-safe LSM-Tree ordered KV engine built over [`hal_vfs::FileSystem`].
 //!
-//! Features implemented in Milestone 1:
+//! Features implemented:
 //! - Exclusive directory lock (`LOCK`) held for the engine's lifetime.
 //! - Commit-time `WriteBatch` WAL with single `sync_data()` per transaction.
-//! - Copy-on-Write `Arc<BTreeMap>` MemTable snapshots (read transactions never block writers).
-//! - Ordered SSTable flush, multi-way merge scan (`MergeIterator`), and Compaction with tombstone GC.
+//! - Snapshot Isolation (SI): Copy-on-Write `Arc<BTreeMap>` MemTable snapshots +
+//!   **First-Committer-Wins** write-write conflict detection with automatic commit-history GC.
+//! - Ordered SSTable flush, multi-way merge scan, and Compaction with tombstone GC.
 //! - Reference-counted deferred SSTable reclamation for strict Windows file-handle safety.
+//! - Full on-disk CRC32C integrity inspection (`inspect_database`) powering `anchordb doctor`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::ops::Bound;
 use std::string::String;
 use std::sync::{Arc, Mutex, RwLock};
@@ -16,6 +18,7 @@ use std::vec::Vec;
 use hal_vfs::{FileSystem, StorageFile, VfsError};
 
 use crate::engine::{KvEngine, KvEntry, KvError, KvIterator, KvTransaction};
+use crate::format::{CURRENT_FORMAT_VERSION, SUPERBLOCK_SIZE, SuperblockHeader};
 use crate::manifest::{
     ManifestState, load_manifest, manifest_file_name, persist_manifest, sst_file_name,
     wal_file_name,
@@ -52,6 +55,63 @@ impl Default for LsmConfig {
     }
 }
 
+/// Summary produced by [`inspect_database`] (`anchordb doctor`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorReport {
+    pub format_version: u16,
+    pub manifest_file: String,
+    pub checkpoint_lsn: u64,
+    pub active_wal_file: String,
+    pub wal_records: usize,
+    pub wal_had_torn_tail: bool,
+    pub sst_count: usize,
+    pub total_sst_entries: usize,
+}
+
+/// Verifies Manifest, every active SSTable (Superblock + Footer + Index + all Data Blocks CRC32C),
+/// and the active WAL file under an exclusive directory lock.
+pub fn inspect_database<F: FileSystem>(fs: &F) -> Result<DoctorReport, KvError> {
+    let _lock = fs.lock_exclusive(LOCK_FILE_NAME)?;
+    let Some(manifest) = load_manifest(fs)? else {
+        return Err(KvError::Vfs(VfsError::NotFound));
+    };
+
+    let manifest_name = manifest_file_name(manifest.manifest_file_id);
+    let format_version = {
+        let mf = fs.open_read_only(&manifest_name)?;
+        let mut sb = [0u8; SUPERBLOCK_SIZE];
+        mf.read_exact_at(0, &mut sb)?;
+        let header = SuperblockHeader::decode(&sb)?;
+        header.check_compatibility(CURRENT_FORMAT_VERSION, 0)?;
+        header.format_version
+    };
+
+    let mut total_sst_entries = 0usize;
+    for meta in &manifest.tables {
+        let name = sst_file_name(meta.file_id);
+        let ro = fs.open_read_only(&name)?;
+        let reader = SstReader::open(ro, meta.clone())?;
+        // Read every data block to verify all block-level CRC32C checksums.
+        let entries = reader.read_all()?;
+        total_sst_entries = total_sst_entries.saturating_add(entries.len());
+    }
+
+    let wal_name = wal_file_name(manifest.active_wal_id);
+    let mut wal_file = fs.open_or_create(&wal_name)?;
+    let wal_rec = recover_wal(&mut wal_file)?;
+
+    Ok(DoctorReport {
+        format_version,
+        manifest_file: manifest_name,
+        checkpoint_lsn: manifest.checkpoint_lsn,
+        active_wal_file: wal_name,
+        wal_records: wal_rec.batches.len(),
+        wal_had_torn_tail: wal_rec.truncated_tail,
+        sst_count: manifest.tables.len(),
+        total_sst_entries,
+    })
+}
+
 type MemMap = BTreeMap<Vec<u8>, (u64, WriteOp)>;
 
 #[derive(Debug)]
@@ -69,8 +129,29 @@ struct EngineState<F: FileSystem> {
     wal: WalWriter<F::File>,
     last_lsn: u64,
     next_txn_id: u64,
+    /// Active read-write transactions' snapshot start LSNs (`start_lsn -> count`).
+    active_write_starts: BTreeMap<u64, usize>,
+    /// Bounded recent committed write-sets (`(commit_lsn, keys)`) for First-Committer-Wins.
+    committed_writes: VecDeque<(u64, Vec<Vec<u8>>)>,
     obsolete_files: Vec<String>,
     pending_reclaim_ssts: Vec<PendingReclaimSst<F::File>>,
+}
+
+impl<F: FileSystem> EngineState<F> {
+    fn gc_committed_writes(&mut self) {
+        match self.active_write_starts.keys().next().copied() {
+            None => self.committed_writes.clear(),
+            Some(min_start_lsn) => {
+                while self
+                    .committed_writes
+                    .front()
+                    .is_some_and(|(commit_lsn, _)| *commit_lsn <= min_start_lsn)
+                {
+                    self.committed_writes.pop_front();
+                }
+            }
+        }
+    }
 }
 
 /// Persistent ordered KV engine backed by an LSM-Tree over any [`FileSystem`].
@@ -155,6 +236,8 @@ impl<F: FileSystem> LsmEngine<F> {
             wal,
             last_lsn,
             next_txn_id: max_txn_id.saturating_add(1),
+            active_write_starts: BTreeMap::new(),
+            committed_writes: VecDeque::new(),
             obsolete_files: Vec::new(),
             pending_reclaim_ssts: Vec::new(),
         };
@@ -186,6 +269,15 @@ impl<F: FileSystem> LsmEngine<F> {
         Ok(guard.pending_reclaim_ssts.len())
     }
 
+    /// Returns the number of recent committed write-sets retained for conflict detection (for GC tests).
+    pub fn tracked_commit_history_len(&self) -> Result<usize, KvError> {
+        let guard = self
+            .state
+            .read()
+            .map_err(|_| KvError::Vfs(VfsError::IoFailure))?;
+        Ok(guard.committed_writes.len())
+    }
+
     /// Forces a full compaction across all active SSTables (reclaiming overwritten keys & tombstones).
     pub fn compact_all(&self) -> Result<(), KvError> {
         let _wguard = self
@@ -199,6 +291,19 @@ impl<F: FileSystem> LsmEngine<F> {
         self.compact_locked(&mut state)?;
         reclaim_obsolete_locked(&self.fs, &mut state);
         Ok(())
+    }
+
+    fn unregister_write_start(&self, start_lsn: u64) {
+        if let Ok(mut state) = self.state.write() {
+            if let Some(count) = state.active_write_starts.get_mut(&start_lsn) {
+                if *count <= 1 {
+                    state.active_write_starts.remove(&start_lsn);
+                } else {
+                    *count -= 1;
+                }
+            }
+            state.gc_committed_writes();
+        }
     }
 
     fn flush_memtable_locked(&self, state: &mut EngineState<F>) -> Result<(), KvError> {
@@ -344,17 +449,37 @@ impl<F: FileSystem> KvEngine for LsmEngine<F> {
         Self: 'a;
 
     fn begin_txn(&self, read_only: bool) -> Result<Self::Txn<'_>, KvError> {
-        let guard = self
-            .state
-            .read()
-            .map_err(|_| KvError::Vfs(VfsError::IoFailure))?;
-        Ok(LsmTxn {
-            engine: self,
-            read_only,
-            snapshot_mem: Arc::clone(&guard.memtable),
-            snapshot_tables: guard.tables.clone(),
-            write_batch: BTreeMap::new(),
-        })
+        if read_only {
+            let guard = self
+                .state
+                .read()
+                .map_err(|_| KvError::Vfs(VfsError::IoFailure))?;
+            Ok(LsmTxn {
+                engine: self,
+                read_only: true,
+                start_lsn: guard.last_lsn,
+                registered_write_start: None,
+                snapshot_mem: Arc::clone(&guard.memtable),
+                snapshot_tables: guard.tables.clone(),
+                write_batch: BTreeMap::new(),
+            })
+        } else {
+            let mut guard = self
+                .state
+                .write()
+                .map_err(|_| KvError::Vfs(VfsError::IoFailure))?;
+            let start_lsn = guard.last_lsn;
+            *guard.active_write_starts.entry(start_lsn).or_insert(0) += 1;
+            Ok(LsmTxn {
+                engine: self,
+                read_only: false,
+                start_lsn,
+                registered_write_start: Some(start_lsn),
+                snapshot_mem: Arc::clone(&guard.memtable),
+                snapshot_tables: guard.tables.clone(),
+                write_batch: BTreeMap::new(),
+            })
+        }
     }
 
     fn checkpoint(&self) -> Result<(), KvError> {
@@ -372,16 +497,27 @@ impl<F: FileSystem> KvEngine for LsmEngine<F> {
     }
 }
 
-/// Snapshot transaction over [`LsmEngine`].
+/// Snapshot Isolation transaction over [`LsmEngine`].
 ///
 /// Holds an immutable Copy-on-Write MemTable reference and ref-counted SSTable handles,
-/// allowing concurrent `scan` + `get_into` point lookups via `&self`.
+/// allowing concurrent `scan` + `get_into` point lookups via `&self`, and enforcing
+/// First-Committer-Wins write-write conflict detection on `commit()`.
 pub struct LsmTxn<'a, F: FileSystem> {
     engine: &'a LsmEngine<F>,
     read_only: bool,
+    start_lsn: u64,
+    registered_write_start: Option<u64>,
     snapshot_mem: Arc<MemMap>,
     snapshot_tables: Vec<Arc<SstReader<F::File>>>,
     write_batch: BTreeMap<Vec<u8>, WriteOp>,
+}
+
+impl<F: FileSystem> Drop for LsmTxn<'_, F> {
+    fn drop(&mut self) {
+        if let Some(start_lsn) = self.registered_write_start.take() {
+            self.engine.unregister_write_start(start_lsn);
+        }
+    }
 }
 
 /// Ordered iterator yielded by [`LsmTxn::scan`].
@@ -438,7 +574,7 @@ impl<F: FileSystem> KvTransaction for LsmTxn<'_, F> {
         // WriteBatch > MemTable > SSTables (newest -> oldest).
         let mut merged: BTreeMap<Vec<u8>, WriteOp> = BTreeMap::new();
 
-        for (k, op) in self.write_batch.iter() {
+        for (k, op) in &self.write_batch {
             if key_in_bounds(k, start, end) {
                 merged.insert(k.clone(), op.clone());
             }
@@ -487,17 +623,17 @@ impl<F: FileSystem> KvTransaction for LsmTxn<'_, F> {
         Ok(())
     }
 
-    fn commit(self) -> Result<(), KvError> {
+    fn commit(mut self) -> Result<(), KvError> {
         if self.read_only || self.write_batch.is_empty() {
             return Ok(());
         }
 
         let engine = self.engine;
-        let write_batch = self.write_batch;
-        // Release this transaction's snapshot references before acquiring the write lock so
-        // deferred SSTable reclamation and COW MemTable mutation can proceed cleanly.
-        drop(self.snapshot_mem);
-        drop(self.snapshot_tables);
+        let start_lsn = self.start_lsn;
+        let write_batch = core::mem::take(&mut self.write_batch);
+        // Release snapshot references before acquiring write lock so deferred reclamation and COW work.
+        self.snapshot_mem = Arc::new(MemMap::new());
+        self.snapshot_tables.clear();
 
         let _wguard = engine
             .write_guard
@@ -508,8 +644,17 @@ impl<F: FileSystem> KvTransaction for LsmTxn<'_, F> {
             .write()
             .map_err(|_| KvError::Vfs(VfsError::IoFailure))?;
 
+        // 0. Snapshot Isolation: First-Committer-Wins write-write conflict detection.
+        for (commit_lsn, committed_keys) in &state.committed_writes {
+            if *commit_lsn > start_lsn && committed_keys.iter().any(|k| write_batch.contains_key(k))
+            {
+                return Err(KvError::WriteConflict);
+            }
+        }
+
         let lsn = state.last_lsn.saturating_add(1);
         let txn_id = state.next_txn_id;
+        let written_keys: Vec<Vec<u8>> = write_batch.keys().cloned().collect();
         let entries: Vec<(Vec<u8>, WriteOp)> = write_batch.into_iter().collect();
         let batch = WriteBatch {
             lsn,
@@ -530,6 +675,21 @@ impl<F: FileSystem> KvTransaction for LsmTxn<'_, F> {
         }
         state.memtable_bytes = mem_bytes;
 
+        // Record this commit for concurrent write-conflict checks, unregister self, and GC old history.
+        if let Some(reg_start) = self.registered_write_start.take()
+            && let Some(count) = state.active_write_starts.get_mut(&reg_start)
+        {
+            if *count <= 1 {
+                state.active_write_starts.remove(&reg_start);
+            } else {
+                *count -= 1;
+            }
+        }
+        if !state.active_write_starts.is_empty() {
+            state.committed_writes.push_back((lsn, written_keys));
+        }
+        state.gc_committed_writes();
+
         // 3. Trigger Flush & Compaction when thresholds are reached.
         if state.memtable_bytes >= engine.config.memtable_flush_bytes {
             engine.flush_memtable_locked(&mut state)?;
@@ -544,7 +704,7 @@ impl<F: FileSystem> KvTransaction for LsmTxn<'_, F> {
     }
 
     fn abort(self) {
-        // Dropping `write_batch` discards all uncommitted changes with zero WAL/MemTable impact.
+        // Dropping `self` discards `write_batch` and unregisters `active_write_starts`.
     }
 }
 

@@ -1,7 +1,14 @@
 //! Structured query API, SQL pipeline, and `DataChunk` pull-based execution engine.
 
+#[cfg(feature = "structured-api")]
+pub mod api;
+
+#[cfg(feature = "structured-api")]
+pub use api::{
+    AccessPath, CmpOp, ColExpr, Expr, IntoValue, QueryError, QueryPlan, QueryRow, TableQuery, col,
+};
 pub use kv_core::KvError;
-pub use table_codec::{IndexId, SchemaVersion, TableId};
+pub use table_codec::{IndexId, SchemaVersion, SortOrder, TableId, Value};
 
 /// Default per-query memory quota (64 MiB) to guard against OOM in hash/sort operators.
 pub const DEFAULT_QUERY_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;

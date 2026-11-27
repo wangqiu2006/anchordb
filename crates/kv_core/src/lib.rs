@@ -25,4 +25,4 @@ pub use format::{
     VersionCompatibility, crc32c,
 };
 #[cfg(feature = "std")]
-pub use lsm::{LsmConfig, LsmEngine, LsmIter, LsmTxn};
+pub use lsm::{DoctorReport, LsmConfig, LsmEngine, LsmIter, LsmTxn, inspect_database};

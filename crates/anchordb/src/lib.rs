@@ -3,14 +3,26 @@
 #[cfg(feature = "mode-embedded")]
 extern crate std;
 
+#[cfg(feature = "mode-embedded")]
+pub mod embedded;
+
 pub use hal_vfs;
 pub use kv_core;
 
 #[cfg(feature = "mode-embedded")]
-pub use table_codec;
+pub use embedded::{AnchorDb, DbError, DbTxn, TableQueryHandle};
 
 #[cfg(feature = "mode-embedded")]
-pub use query_engine;
+pub use query_engine::{
+    self, AccessPath, CmpOp, ColExpr, Expr, IntoValue, QueryConfig, QueryError, QueryPlan,
+    QueryRow, TableQuery, col,
+};
+
+#[cfg(feature = "mode-embedded")]
+pub use table_codec::{
+    self, CodecError, ColumnDef, ColumnSpec, ColumnType, IndexDef, IndexSpec, SchemaVersion,
+    SortOrder, SystemCatalog, TableId, TableSchema, TableStore, Value,
+};
 
 #[cfg(feature = "mode-server")]
 pub use server_net;
