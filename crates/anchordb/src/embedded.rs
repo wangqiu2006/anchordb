@@ -245,6 +245,20 @@ impl<F: FileSystem> SqlSession<'_, F> {
         self.active_txn.is_some()
     }
 
+    pub fn list_tables(&self) -> Result<Vec<TableSchema>, DbError> {
+        if let Some(txn) = self.active_txn.as_ref() {
+            Ok(SystemCatalog::list_tables(txn)?)
+        } else {
+            self.db.list_tables()
+        }
+    }
+
+    pub fn rollback_if_active(&mut self) {
+        if let Some(txn) = self.active_txn.take() {
+            txn.abort();
+        }
+    }
+
     /// Parses and executes one or more semicolon-separated SQL statements.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<SqlResult>, DbError> {
         let statements = parse_sql(sql)?;

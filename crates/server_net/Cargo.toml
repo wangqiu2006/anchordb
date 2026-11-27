@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 query_engine = { path = "../query_engine" }
+table_codec = { path = "../table_codec" }
 
 [lints]
 workspace = true

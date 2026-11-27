@@ -42,15 +42,89 @@ fn main() {
             run_shell(&db_path, version, profile);
         }
         Some("serve") => {
-            eprintln!(
-                "anchordb {version} ({profile}): `serve` (pgwire network server) arrives in Phase 3B"
-            );
-            std::process::exit(2);
+            #[cfg(feature = "mode-server")]
+            {
+                run_serve(args, version, profile);
+            }
+            #[cfg(not(feature = "mode-server"))]
+            {
+                eprintln!(
+                    "anchordb {version} ({profile}): rebuild with `--features mode-server` to enable `serve`"
+                );
+                std::process::exit(2);
+            }
         }
         _ => {
             println!("AnchorDB {version} ({profile})");
             println!("Usage: anchordb <shell|doctor|serve> [options]");
         }
+    }
+}
+
+#[cfg(feature = "mode-server")]
+fn run_serve(mut args: impl Iterator<Item = String>, version: &str, profile: &str) {
+    use std::sync::Arc;
+
+    let Some(db_path) = args.next() else {
+        eprintln!("Usage: anchordb serve <db_path> [--listen 127.0.0.1:5432] [--password <pwd>]");
+        std::process::exit(2);
+    };
+
+    let mut cfg = anchordb::ServerConfig::default();
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--listen" => {
+                if let Some(addr) = args.next() {
+                    cfg.listen_addr = addr;
+                } else {
+                    eprintln!("--listen requires an address (e.g. 127.0.0.1:5432)");
+                    std::process::exit(2);
+                }
+            }
+            "--password" => {
+                if let Some(pwd) = args.next() {
+                    cfg.password = Some(pwd);
+                } else {
+                    eprintln!("--password requires a value");
+                    std::process::exit(2);
+                }
+            }
+            other => {
+                eprintln!("Unknown option for `serve`: {other}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    let db = match AnchorDb::open(&db_path) {
+        Ok(db) => Arc::new(db),
+        Err(err) => {
+            eprintln!("Failed to open database '{db_path}': {err}");
+            std::process::exit(1);
+        }
+    };
+
+    let server = match anchordb::start_pg_server(db, cfg) {
+        Ok(srv) => srv,
+        Err(err) => {
+            eprintln!("Failed to start PostgreSQL wire server: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    let addr = server.local_addr();
+    println!("AnchorDB {version} ({profile}) listening on {addr}");
+    println!("Database: {db_path}");
+    println!(
+        "Connect with: psql -h {} -p {} -U postgres",
+        addr.ip(),
+        addr.port()
+    );
+    println!("Press Ctrl+C to stop.");
+
+    // Block main thread cleanly until terminated by signal.
+    loop {
+        std::thread::park();
     }
 }
 

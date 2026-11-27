@@ -6,6 +6,9 @@ extern crate std;
 #[cfg(feature = "mode-embedded")]
 pub mod embedded;
 
+#[cfg(feature = "mode-server")]
+pub mod server;
+
 pub use hal_vfs;
 pub use kv_core;
 
@@ -25,7 +28,11 @@ pub use table_codec::{
 };
 
 #[cfg(feature = "mode-server")]
-pub use server_net;
+pub use server::start_pg_server;
+#[cfg(feature = "mode-server")]
+pub use server_net::{
+    self, DEFAULT_LISTEN_ADDR, PgServer, ServerConfig, ServerSession, SqlBackend,
+};
 
 /// Compile-time form factor selected via Cargo features.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

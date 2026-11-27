@@ -4,18 +4,18 @@ A modular, cross-platform, power-loss-safe database kernel written in Rust follo
 
 - **`mode-mcu`** (`#![no_std]`): `hal_vfs` + `kv_core` for mid-to-high-end MCUs (≥ 256 KB RAM, primary target **ESP32-S3-N16R8** with 512 KB SRAM / 8 MB PSRAM / 16 MB Flash).
 - **`mode-embedded`** (`std`): adds `table_codec` + `query_engine` (fluent structured API + embedded SQL + `DataChunk` executor) and CLI (`shell` / `doctor`) for desktop apps and games.
-- **`mode-server`** (`std`): adds MVCC + full SQL + `server_net` (`pgwire` + `pg_catalog` compatibility) for client-server OLTP workloads *(Phase 3B in progress)*.
+- **`mode-server`** (`std`): adds MVCC Snapshot Isolation + full SQL + `server_net` (PostgreSQL v3.0 wire protocol + `pg_catalog`/`information_schema` compatibility + `anchordb serve`) for `psql` / DBeaver / Navicat / `psycopg2` clients.
 
 ---
 
 ## Architecture & Module Decoupling
 
-Dependencies are strictly unidirectional (acyclic DAG). Upper layers (`table_codec`, `query_engine`) program exclusively against `kv_core` traits (`KvEngine` / `KvTransaction` / `KvIterator`) and never reference concrete storage engines or filesystems (`LsmEngine`, `StdFileSystem`, `FaultSimFs`).
+Dependencies are strictly unidirectional (acyclic DAG). Upper layers (`table_codec`, `query_engine`, `server_net`) program exclusively against abstract traits (`KvTransaction`, `SqlBackend`, `ServerSession`) and never reference concrete storage engines or filesystems (`LsmEngine`, `StdFileSystem`, `FaultSimFs`).
 
 ```mermaid
 flowchart TD
     Facade["anchordb (Facade & CLI: shell / doctor / serve)"]
-    Net["server_net (pgwire + pg_catalog)"]
+    Net["server_net (PostgreSQL v3.0 Wire Protocol + pg_catalog)"]
     Query["query_engine (Structured API / SQL / RBO / DataChunk)"]
     Codec["table_codec (Memcomparable Keys / Catalog / Versioned Rows)"]
     Kv["kv_core (no_std core / LSM-Tree / WAL / SSTable / SI)"]
@@ -27,6 +27,7 @@ flowchart TD
     Facade --> Kv
     Facade --> Vfs
     Net --> Query
+    Net --> Codec
     Query --> Codec
     Query --> Kv
     Codec --> Kv
@@ -40,15 +41,15 @@ flowchart TD
 | `crates/hal_vfs` | *(none)* | **0** | ✅ Ready | `#![no_std]` `FileSystem`/`StorageFile`/`FileLock` traits, `std_fs` (OS lock + `sync_dir`), `mcu_flash` (ESP32-S3 NOR alignment checks), deterministic `fault_sim` power-loss VFS |
 | `crates/kv_core` | `hal_vfs` | **0** | ✅ Ready | `#![no_std]` CRC32C & 64B Little-Endian Superblock, Commit-time `WriteBatch` WAL (tail torn-write truncation vs mid-file bit-rot rejection), atomic `Manifest`/`CURRENT`, SSTable, Compaction, Windows deferred reclamation, Snapshot Isolation (First-Committer-Wins), `inspect_database` |
 | `crates/table_codec` | `kv_core` | **0** | ✅ Ready | Memcomparable order-preserving encoding (signed int, canonical f64, 8B chunked varlen, ASC/DESC), self-hosted System Catalog (`0x00`), zero-rewrite versioned rows (`schema_version` + `ColumnId`), unique & non-unique composite secondary indexes |
-| `crates/query_engine` | `kv_core`, `table_codec` | `sqlparser` *(optional)* | ✅ Phase 3A | Chainable structured query API (`col(...).gte(...)`), `DataChunk` columnar pull operators (`Filter`, `Projection`, `HashJoin`, `HashAggregate`, `Distinct`, `TopNSort`), PostgreSQL-dialect SQL parser/binder/RBO index selection, per-query memory budget |
-| `crates/server_net` | `query_engine` | *(planned)* | 🚧 Phase 3B | PostgreSQL wire protocol (`pgwire`) & `pg_catalog` compatibility layer (default loopback bind `127.0.0.1:5432`) |
-| `crates/anchordb` | all *(optional by feature)* | *(via crates)* | ✅ Embedded & CLI | Unified `AnchorDb` embedded facade, stateful `SqlSession`, interactive `anchordb shell`, and `anchordb doctor` CRC integrity checker |
+| `crates/query_engine` | `kv_core`, `table_codec` | `sqlparser` *(optional)* | ✅ Ready | Chainable structured query API (`col(...).gte(...)`), `DataChunk` columnar pull operators (`Filter`, `Projection`, `HashJoin`, `HashAggregate`, `Distinct`, `TopNSort`), PostgreSQL-dialect SQL parser/binder/RBO index selection, per-query memory budget |
+| `crates/server_net` | `query_engine`, `table_codec` | **0** | ✅ Ready | Zero-dependency PostgreSQL Wire Protocol v3.0 TCP server (`Simple Query` + `Extended Query` Parse/Bind/Describe/Execute + optional password auth + `pg_catalog`/`information_schema` compatibility), default loopback bind `127.0.0.1:5432` |
+| `crates/anchordb` | all *(optional by feature)* | *(via crates)* | ✅ Ready | Unified `AnchorDb` embedded facade, stateful `SqlSession`, interactive `anchordb shell`, `anchordb doctor`, and `anchordb serve` |
 
 ---
 
 ## Quick Start
 
-### 1. Interactive Local SQL Shell & Integrity Doctor
+### 1. Local Interactive SQL Shell & Integrity Doctor
 ```bash
 # Launch interactive SQL shell on a local database directory
 cargo run -p anchordb -- shell ./demo.db
@@ -57,14 +58,26 @@ cargo run -p anchordb -- shell ./demo.db
 cargo run -p anchordb -- doctor ./demo.db
 ```
 
-Supported SQL in `anchordb shell`:
+### 2. PostgreSQL-Compatible Network Server (`mode-server`)
+```bash
+# Start PostgreSQL v3.0 server (binds loopback 127.0.0.1:5432 by default)
+cargo run -p anchordb --features mode-server -- serve ./demo.db --listen 127.0.0.1:5432
+
+# Optional password authentication
+cargo run -p anchordb --features mode-server -- serve ./demo.db --listen 127.0.0.1:5432 --password secret
+
+# Connect with psql, DBeaver, Navicat, or psycopg2
+psql -h 127.0.0.1 -p 5432 -U postgres -d anchordb
+```
+
+Supported SQL:
 - DDL: `CREATE TABLE`, `CREATE [UNIQUE] INDEX`, `ALTER TABLE ADD/DROP COLUMN`, `SHOW TABLES`
 - DML: `INSERT INTO ... VALUES ...`, `UPDATE ... SET ... WHERE ...`, `DELETE FROM ... WHERE ...`
 - Query: `SELECT [DISTINCT] ... FROM ... [INNER|LEFT JOIN ... ON ...] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ...] [OFFSET ...]`, `EXPLAIN <SELECT ...>`
-- Transactions: `BEGIN`, `COMMIT`, `ROLLBACK`
-- Meta-commands: `.tables`, `.checkpoint`, `.help`, `.quit`
+- Transactions: `BEGIN`, `COMMIT`, `ROLLBACK` (Snapshot Isolation; write conflicts return SQLSTATE `40001`)
+- Client compatibility: `SET`/`SHOW`, `version()`, `current_schema()`, `current_database()`, `pg_catalog.{pg_namespace, pg_class, pg_attribute, pg_type}`, `information_schema.{tables, columns}`
 
-### 2. Embedded Rust API (Desktop / Game Usage)
+### 3. Embedded Rust API (Desktop / Game Usage)
 ```rust
 use anchordb::{AnchorDb, ColumnSpec, ColumnType, IndexSpec, SortOrder, Value, col};
 
@@ -114,15 +127,18 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Current test suite (**41 tests passing**):
+Current test suite (**43 tests passing** across default & `mode-server`):
 - **1000-seed deterministic power-loss crash recovery** (`crash_recovery_1000_random_seeds`): tests WAL write-budget cuts, torn writes, unsynced write drop/reorder, unsynced dir rollback, Flush/Manifest/Compaction, and Windows strict file-handle semantics.
 - **Hermitage Snapshot Isolation suite** (`mvcc_hermitage.rs`): verifies G1a/G1b/P4 Lost Update prevention, PMP repeatable-read/phantom prevention, and 4-thread CAS retry consistency.
 - **Relational & SQL regression suite** (`table_integration.rs`, `embedded_game_inventory.rs`, `sql_regression.rs`): verifies Memcomparable ordering, unique/composite DESC indexes, online schema evolution (add/drop/re-add), `IndexScan` vs `SeqScan` correctness oracle, JOINs, aggregates, explicit transactions, memory budgets, and `doctor`.
+- **PostgreSQL Wire Protocol E2E suite** (`pgwire_server_e2e.rs`): verifies real TCP `SSLRequest` handshake, CleartextPassword auth (`28P01`), Simple & Extended (`Parse`/`Bind`/`Describe`/`Execute`) queries, `pg_catalog`/`information_schema` probes, and two-client concurrent write conflict returning SQLSTATE `40001`.
 
 ---
 
 ## Changelog
 
+- **Phase 3B (Milestone 3 Complete)**: Implemented zero-dependency PostgreSQL Wire Protocol v3.0 server (`server_net`) with Simple + Extended Query, optional password auth, `pg_catalog`/`information_schema` compatibility layer, `anchordb serve` CLI, and real TCP E2E test suite.
+- **Docs & Feature Hygiene** (`c0a5226`): Audited module decoupling, fixed `query_engine` `sql -> structured-api` feature dependency, and synced full architecture/usage docs to `README.md`.
 - **Phase 3A** (`a652bc8`): Implemented columnar `DataChunk` pull-based operators (`Filter`, `Projection`, `HashJoin`, `HashAggregate`, `Distinct`, `TopNSort`), PostgreSQL-dialect SQL parser/binder/RBO index selection (`sqlparser 0.64`), stateful `SqlSession` (`BEGIN`/`COMMIT`/`ROLLBACK`), interactive `anchordb shell`, and SQL regression/oracle test suite.
 - **Phase 2B** (`5eccf25`): Added Snapshot Isolation First-Committer-Wins write-conflict detection with bounded commit-history GC, Hermitage isolation test suite, `inspect_database` + `anchordb doctor <db_path>`, chainable `query_engine::api` with automatic index selection & memory budgets, and `AnchorDb` embedded facade.
 - **Phase 2A** (`da9917c`): Implemented `table_codec` with Memcomparable order-preserving encoding, zero-rewrite versioned rows, self-hosted System Catalog with historical schema preservation, and transactional unique/non-unique composite secondary indexes.
