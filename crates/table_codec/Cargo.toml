@@ -1,0 +1,16 @@
+[package]
+name = "table_codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["std"]
+std = ["kv_core/std"]
+
+[dependencies]
+kv_core = { path = "../kv_core", default-features = false, features = ["alloc"] }
+
+[lints]
+workspace = true

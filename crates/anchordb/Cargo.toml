@@ -1,0 +1,38 @@
+[package]
+name = "anchordb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["mode-embedded"]
+mode-mcu = ["hal_vfs/mode-mcu", "kv_core/mode-mcu"]
+mode-embedded = [
+    "hal_vfs/std",
+    "kv_core/std",
+    "dep:table_codec",
+    "dep:query_engine",
+    "query_engine?/structured-api",
+]
+mode-server = [
+    "mode-embedded",
+    "kv_core/mvcc",
+    "query_engine?/sql",
+    "dep:server_net",
+]
+
+[[bin]]
+name = "anchordb"
+path = "src/main.rs"
+required-features = ["mode-embedded"]
+
+[dependencies]
+hal_vfs = { path = "../hal_vfs", default-features = false }
+kv_core = { path = "../kv_core", default-features = false }
+table_codec = { path = "../table_codec", optional = true }
+query_engine = { path = "../query_engine", optional = true }
+server_net = { path = "../server_net", optional = true }
+
+[lints]
+workspace = true

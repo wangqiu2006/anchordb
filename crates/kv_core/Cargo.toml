@@ -1,0 +1,19 @@
+[package]
+name = "kv_core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["std"]
+alloc = []
+std = ["alloc", "hal_vfs/std"]
+mode-mcu = ["hal_vfs/mode-mcu"]
+mvcc = ["std"]
+
+[dependencies]
+hal_vfs = { path = "../hal_vfs", default-features = false }
+
+[lints]
+workspace = true

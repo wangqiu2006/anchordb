@@ -1,0 +1,12 @@
+[package]
+name = "server_net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+query_engine = { path = "../query_engine" }
+
+[lints]
+workspace = true

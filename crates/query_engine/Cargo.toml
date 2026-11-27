@@ -1,0 +1,18 @@
+[package]
+name = "query_engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["structured-api"]
+structured-api = []
+sql = []
+
+[dependencies]
+kv_core = { path = "../kv_core" }
+table_codec = { path = "../table_codec" }
+
+[lints]
+workspace = true

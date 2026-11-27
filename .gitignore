@@ -1,0 +1,13 @@
+# Rust build artifacts
+/target
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local test databases
+*.db
+*.wal
+*.sst
