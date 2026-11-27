@@ -14,11 +14,11 @@ mode-embedded = [
     "dep:table_codec",
     "dep:query_engine",
     "query_engine?/structured-api",
+    "query_engine?/sql",
 ]
 mode-server = [
     "mode-embedded",
     "kv_core/mvcc",
-    "query_engine?/sql",
     "dep:server_net",
 ]
 

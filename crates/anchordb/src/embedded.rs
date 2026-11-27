@@ -11,7 +11,10 @@ use hal_vfs::std_fs::StdFileSystem;
 use kv_core::{
     DoctorReport, KvEngine, KvError, KvTransaction, LsmConfig, LsmEngine, LsmTxn, inspect_database,
 };
-use query_engine::{Expr, QueryConfig, QueryError, QueryPlan, QueryRow, TableQuery};
+use query_engine::{
+    Expr, QueryConfig, QueryError, QueryPlan, QueryRow, SqlError, SqlResult, TableQuery,
+    TxnControl, classify_txn_control, execute_statement_in_txn, parse_sql, statement_is_write,
+};
 use table_codec::{
     CodecError, ColumnSpec, IndexSpec, SortOrder, SystemCatalog, TableId, TableSchema, TableStore,
     Value,
@@ -23,6 +26,7 @@ pub enum DbError {
     Kv(KvError),
     Codec(CodecError),
     Query(QueryError),
+    Sql(SqlError),
 }
 
 impl fmt::Display for DbError {
@@ -31,6 +35,7 @@ impl fmt::Display for DbError {
             Self::Kv(err) => write!(f, "{err}"),
             Self::Codec(err) => write!(f, "{err}"),
             Self::Query(err) => write!(f, "{err}"),
+            Self::Sql(err) => write!(f, "{err}"),
         }
     }
 }
@@ -55,7 +60,14 @@ impl From<QueryError> for DbError {
     }
 }
 
-/// Embedded AnchorDB handle supporting transactional CRUD, schema evolution, and structured queries.
+impl From<SqlError> for DbError {
+    fn from(value: SqlError) -> Self {
+        Self::Sql(value)
+    }
+}
+
+/// Embedded AnchorDB handle supporting transactional CRUD, schema evolution, structured queries,
+/// and embedded SQL execution.
 pub struct AnchorDb<F: FileSystem = StdFileSystem> {
     engine: LsmEngine<F>,
     query_config: QueryConfig,
@@ -105,6 +117,22 @@ impl<F: FileSystem> AnchorDb<F> {
             txn,
             query_config: self.query_config,
         })
+    }
+
+    /// Opens a stateful SQL session supporting `BEGIN` / `COMMIT` / `ROLLBACK` across statements.
+    #[must_use]
+    pub fn sql_session(&self) -> SqlSession<'_, F> {
+        SqlSession {
+            db: self,
+            active_txn: None,
+        }
+    }
+
+    /// Executes one or more SQL statements in a temporary session (auto-commit per statement
+    /// unless explicit `BEGIN`/`COMMIT` are used inside the script).
+    pub fn execute_sql(&self, sql: &str) -> Result<Vec<SqlResult>, DbError> {
+        let mut session = self.sql_session();
+        session.execute(sql)
     }
 
     /// Starts a chainable structured query against `table_name`:
@@ -201,6 +229,83 @@ impl<F: FileSystem> AnchorDb<F> {
     pub fn compact_all(&self) -> Result<(), DbError> {
         self.engine.compact_all()?;
         Ok(())
+    }
+}
+
+/// Stateful SQL session supporting explicit `BEGIN` / `COMMIT` / `ROLLBACK` transactions
+/// as well as auto-commit statements.
+pub struct SqlSession<'a, F: FileSystem> {
+    db: &'a AnchorDb<F>,
+    active_txn: Option<LsmTxn<'a, F>>,
+}
+
+impl<F: FileSystem> SqlSession<'_, F> {
+    #[must_use]
+    pub const fn in_transaction(&self) -> bool {
+        self.active_txn.is_some()
+    }
+
+    /// Parses and executes one or more semicolon-separated SQL statements.
+    pub fn execute(&mut self, sql: &str) -> Result<Vec<SqlResult>, DbError> {
+        let statements = parse_sql(sql)?;
+        let mut results = Vec::with_capacity(statements.len());
+
+        for stmt in &statements {
+            if let Some(ctrl) = classify_txn_control(stmt) {
+                match ctrl {
+                    TxnControl::Begin => {
+                        if self.active_txn.is_some() {
+                            return Err(DbError::Sql(SqlError::Transaction(
+                                "a transaction is already active".to_owned(),
+                            )));
+                        }
+                        self.active_txn = Some(self.db.engine.begin_txn(false)?);
+                        results.push(SqlResult::Message("BEGIN".to_owned()));
+                    }
+                    TxnControl::Commit => {
+                        let Some(txn) = self.active_txn.take() else {
+                            return Err(DbError::Sql(SqlError::Transaction(
+                                "no active transaction to COMMIT".to_owned(),
+                            )));
+                        };
+                        txn.commit()?;
+                        results.push(SqlResult::Message("COMMIT".to_owned()));
+                    }
+                    TxnControl::Rollback => {
+                        let Some(txn) = self.active_txn.take() else {
+                            return Err(DbError::Sql(SqlError::Transaction(
+                                "no active transaction to ROLLBACK".to_owned(),
+                            )));
+                        };
+                        txn.abort();
+                        results.push(SqlResult::Message("ROLLBACK".to_owned()));
+                    }
+                }
+                continue;
+            }
+
+            if let Some(txn) = self.active_txn.as_mut() {
+                let res = execute_statement_in_txn(txn, stmt, &self.db.query_config)?;
+                results.push(res);
+            } else {
+                let read_only = !statement_is_write(stmt);
+                let mut txn = self.db.engine.begin_txn(read_only)?;
+                match execute_statement_in_txn(&mut txn, stmt, &self.db.query_config) {
+                    Ok(res) => {
+                        if !read_only {
+                            txn.commit()?;
+                        }
+                        results.push(res);
+                    }
+                    Err(err) => {
+                        txn.abort();
+                        return Err(DbError::Sql(err));
+                    }
+                }
+            }
+        }
+
+        Ok(results)
     }
 }
 

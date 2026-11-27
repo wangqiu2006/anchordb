@@ -6,13 +6,17 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["structured-api"]
+default = ["structured-api", "sql"]
 structured-api = []
-sql = []
+sql = ["dep:sqlparser"]
 
 [dependencies]
 kv_core = { path = "../kv_core" }
 table_codec = { path = "../table_codec" }
+sqlparser = { version = "0.64", optional = true }
+
+[dev-dependencies]
+hal_vfs = { path = "../hal_vfs" }
 
 [lints]
 workspace = true

@@ -10,12 +10,12 @@ pub use hal_vfs;
 pub use kv_core;
 
 #[cfg(feature = "mode-embedded")]
-pub use embedded::{AnchorDb, DbError, DbTxn, TableQueryHandle};
+pub use embedded::{AnchorDb, DbError, DbTxn, SqlSession, TableQueryHandle};
 
 #[cfg(feature = "mode-embedded")]
 pub use query_engine::{
-    self, AccessPath, CmpOp, ColExpr, Expr, IntoValue, QueryConfig, QueryError, QueryPlan,
-    QueryRow, TableQuery, col,
+    self, AccessPath, CmpOp, ColExpr, DataChunk, Expr, IntoValue, QueryConfig, QueryError,
+    QueryPlan, QueryRow, SqlError, SqlResult, TableQuery, col, format_sql_result, format_value,
 };
 
 #[cfg(feature = "mode-embedded")]

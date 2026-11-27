@@ -2,12 +2,27 @@
 
 #[cfg(feature = "structured-api")]
 pub mod api;
+#[cfg(feature = "sql")]
+pub mod chunk;
+#[cfg(feature = "sql")]
+pub mod sql;
 
 #[cfg(feature = "structured-api")]
 pub use api::{
     AccessPath, CmpOp, ColExpr, Expr, IntoValue, QueryError, QueryPlan, QueryRow, TableQuery, col,
 };
+#[cfg(feature = "sql")]
+pub use chunk::{
+    AggregateExpr, BinOp, BoundExpr, ChunkSourceExec, ColumnMeta, DataChunk, DistinctExec,
+    Executor, FilterExec, HashAggregateExec, HashJoinExec, JoinKind, ProjectionExec, SqlError,
+    TopNSortExec, UnaryOp, collect_executor,
+};
 pub use kv_core::KvError;
+#[cfg(feature = "sql")]
+pub use sql::{
+    SqlResult, TxnControl, classify_txn_control, execute_statement_in_txn, format_sql_result,
+    format_value, parse_sql, statement_is_write,
+};
 pub use table_codec::{IndexId, SchemaVersion, SortOrder, TableId, Value};
 
 /// Default per-query memory quota (64 MiB) to guard against OOM in hash/sort operators.
