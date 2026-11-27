@@ -8,7 +8,7 @@ rust-version.workspace = true
 [features]
 default = ["structured-api", "sql"]
 structured-api = []
-sql = ["dep:sqlparser"]
+sql = ["structured-api", "dep:sqlparser"]
 
 [dependencies]
 kv_core = { path = "../kv_core" }
