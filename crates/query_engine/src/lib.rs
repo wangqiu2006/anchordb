@@ -20,8 +20,8 @@ pub use chunk::{
 pub use kv_core::KvError;
 #[cfg(feature = "sql")]
 pub use sql::{
-    SqlResult, TxnControl, classify_txn_control, execute_statement_in_txn, format_sql_result,
-    format_value, parse_sql, statement_is_write,
+    SqlResult, TxnControl, classify_txn_control, execute_sql_on_virtual_table,
+    execute_statement_in_txn, format_sql_result, format_value, parse_sql, statement_is_write,
 };
 pub use table_codec::{IndexId, SchemaVersion, SortOrder, TableId, Value};
 

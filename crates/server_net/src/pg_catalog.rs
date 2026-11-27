@@ -3,7 +3,7 @@
 //! Enables standard tools (`psql`, DBeaver, Navicat, `psycopg2`) to connect, negotiate session
 //! parameters, and introspect tables & columns cleanly without external dependencies.
 
-use query_engine::{SqlError, SqlResult};
+use query_engine::{ColumnMeta, QueryConfig, SqlError, SqlResult, execute_sql_on_virtual_table};
 use table_codec::{ColumnType, TableSchema, Value};
 
 use crate::backend::ServerSession;
@@ -104,36 +104,70 @@ pub fn try_handle_pg_compat<S: ServerSession>(
     }
 
     // 4. `pg_catalog` & `information_schema` virtual metadata tables.
+    // Execute client SELECT/WHERE/ORDER BY/LIMIT over the virtual table via `DataChunk` operators
+    // (falling back to full virtual rows if the client uses exotic PG-only cast syntax).
     if lower.contains("pg_namespace") {
-        return Ok(Some(vec![virtual_pg_namespace()]));
+        return Ok(Some(vec![run_virtual_query(
+            trimmed,
+            "pg_namespace",
+            virtual_pg_namespace(),
+        )]));
     }
     if lower.contains("pg_type") {
-        return Ok(Some(vec![virtual_pg_type()]));
+        return Ok(Some(vec![run_virtual_query(
+            trimmed,
+            "pg_type",
+            virtual_pg_type(),
+        )]));
     }
     if lower.contains("pg_class") {
         let tables = session.list_tables()?;
-        return Ok(Some(vec![virtual_pg_class(&tables)]));
+        return Ok(Some(vec![run_virtual_query(
+            trimmed,
+            "pg_class",
+            virtual_pg_class(&tables),
+        )]));
     }
     if lower.contains("pg_attribute") {
         let tables = session.list_tables()?;
-        return Ok(Some(vec![virtual_pg_attribute(&tables)]));
+        return Ok(Some(vec![run_virtual_query(
+            trimmed,
+            "pg_attribute",
+            virtual_pg_attribute(&tables),
+        )]));
     }
     if lower.contains("information_schema.tables") {
         let tables = session.list_tables()?;
-        return Ok(Some(vec![virtual_info_schema_tables(
-            database_name,
-            &tables,
+        return Ok(Some(vec![run_virtual_query(
+            trimmed,
+            "tables",
+            virtual_info_schema_tables(database_name, &tables),
         )]));
     }
     if lower.contains("information_schema.columns") {
         let tables = session.list_tables()?;
-        return Ok(Some(vec![virtual_info_schema_columns(
-            database_name,
-            &tables,
+        return Ok(Some(vec![run_virtual_query(
+            trimmed,
+            "columns",
+            virtual_info_schema_columns(database_name, &tables),
         )]));
     }
 
     Ok(None)
+}
+
+fn run_virtual_query(sql: &str, table_name: &str, full_table: SqlResult) -> SqlResult {
+    let SqlResult::Rows { columns, rows } = full_table else {
+        return full_table;
+    };
+    let metas: Vec<ColumnMeta> = columns
+        .iter()
+        .map(|c| ColumnMeta::new(Some(table_name.to_owned()), c.clone(), None))
+        .collect();
+    match execute_sql_on_virtual_table(sql, metas, rows.clone(), &QueryConfig::default()) {
+        Ok(projected) => projected,
+        Err(_) => SqlResult::Rows { columns, rows },
+    }
 }
 
 fn handle_scalar_pg_probe(lower: &str, database_name: &str, user_name: &str) -> SqlResult {

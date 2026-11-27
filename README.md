@@ -137,7 +137,8 @@ Current test suite (**43 tests passing** across default & `mode-server`):
 
 ## Changelog
 
-- **Phase 3B (Milestone 3 Complete)**: Implemented zero-dependency PostgreSQL Wire Protocol v3.0 server (`server_net`) with Simple + Extended Query, optional password auth, `pg_catalog`/`information_schema` compatibility layer, `anchordb serve` CLI, and real TCP E2E test suite.
+- **Real Client Verification & Virtual `pg_catalog` Projection**: Verified live TCP connectivity using Python `pg8000` (PostgreSQL v3 Extended Query protocol), upgraded `pg_catalog`/`information_schema` virtual views to execute full `DataChunk` projection/`WHERE`/`ORDER BY`/`LIMIT`.
+- **Phase 3B (Milestone 3 Complete)** (`430ce72`): Implemented zero-dependency PostgreSQL Wire Protocol v3.0 server (`server_net`) with Simple + Extended Query, optional password auth, `pg_catalog`/`information_schema` compatibility layer, `anchordb serve` CLI, and real TCP E2E test suite.
 - **Docs & Feature Hygiene** (`c0a5226`): Audited module decoupling, fixed `query_engine` `sql -> structured-api` feature dependency, and synced full architecture/usage docs to `README.md`.
 - **Phase 3A** (`a652bc8`): Implemented columnar `DataChunk` pull-based operators (`Filter`, `Projection`, `HashJoin`, `HashAggregate`, `Distinct`, `TopNSort`), PostgreSQL-dialect SQL parser/binder/RBO index selection (`sqlparser 0.64`), stateful `SqlSession` (`BEGIN`/`COMMIT`/`ROLLBACK`), interactive `anchordb shell`, and SQL regression/oracle test suite.
 - **Phase 2B** (`5eccf25`): Added Snapshot Isolation First-Committer-Wins write-conflict detection with bounded commit-history GC, Hermitage isolation test suite, `inspect_database` + `anchordb doctor <db_path>`, chainable `query_engine::api` with automatic index selection & memory budgets, and `AnchorDb` embedded facade.

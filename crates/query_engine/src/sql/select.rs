@@ -40,6 +40,43 @@ pub(crate) fn exec_query<T: KvTransaction>(
     Ok(SqlResult::Rows { columns, rows })
 }
 
+/// Executes a standard `SELECT` query over an in-memory virtual table (used by `pg_catalog`
+/// and `information_schema` compatibility views for exact projection, `WHERE`, `ORDER BY`, `LIMIT`).
+pub(crate) fn exec_query_on_virtual_table(
+    query: &Query,
+    columns: Vec<ColumnMeta>,
+    rows: Vec<Vec<Value>>,
+    config: &QueryConfig,
+) -> Result<SqlResult, SqlError> {
+    let select = extract_select(query)?;
+    let mut plan_lines = vec!["VirtualTableScan".to_owned()];
+
+    // Preserve table alias if the query wrote `FROM pg_catalog.pg_class AS c`.
+    let alias = select.from.first().and_then(|twj| match &twj.relation {
+        TableFactor::Table { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()),
+        _ => None,
+    });
+    let metas: Vec<ColumnMeta> = if let Some(a) = alias {
+        columns
+            .into_iter()
+            .map(|mut m| {
+                m.table = Some(a.clone());
+                m
+            })
+            .collect()
+    } else {
+        columns
+    };
+
+    let source: Box<dyn Executor> = Box::new(ChunkSourceExec::new(metas, rows, config.chunk_rows));
+    let exec = finish_select_pipeline(source, query, select, config, &mut plan_lines)?;
+    let (out_cols, out_rows) = collect_executor(exec)?;
+    Ok(SqlResult::Rows {
+        columns: out_cols,
+        rows: out_rows,
+    })
+}
+
 pub(crate) fn explain_query<T: KvTransaction>(
     txn: &T,
     query: &Query,
@@ -74,7 +111,7 @@ fn build_select_pipeline<T: KvTransaction>(
     let mut plan_lines = Vec::new();
 
     // 1. FROM + JOIN (with RBO index selection on single-table queries).
-    let mut exec: Box<dyn Executor> = if select.from.is_empty() {
+    let exec: Box<dyn Executor> = if select.from.is_empty() {
         plan_lines.push("DummyRowScan (1 row)".to_owned());
         Box::new(ChunkSourceExec::new(Vec::new(), vec![Vec::new()], 1))
     } else {
@@ -152,6 +189,19 @@ fn build_select_pipeline<T: KvTransaction>(
         left_exec
     };
 
+    let exec = finish_select_pipeline(exec, query, select, config, &mut plan_lines)?;
+    // Present EXPLAIN top-down (root operator first).
+    plan_lines.reverse();
+    Ok((exec, plan_lines))
+}
+
+fn finish_select_pipeline(
+    mut exec: Box<dyn Executor>,
+    query: &Query,
+    select: &Select,
+    config: &QueryConfig,
+    plan_lines: &mut Vec<String>,
+) -> Result<Box<dyn Executor>, SqlError> {
     // 2. WHERE Filter.
     if let Some(where_expr) = &select.selection {
         let bound_pred = bind_expr(where_expr, exec.schema())?;
@@ -173,15 +223,10 @@ fn build_select_pipeline<T: KvTransaction>(
         || select.having.is_some()
         || select.projection.iter().any(projection_item_has_aggregate);
 
-    // Keep track of output column names/exprs so ORDER BY can reference aliases or input columns.
     if has_agg {
-        exec =
-            build_aggregate_and_projection(exec, select, group_by_exprs, config, &mut plan_lines)?;
+        exec = build_aggregate_and_projection(exec, select, group_by_exprs, config, plan_lines)?;
     } else {
         let (proj_exprs, proj_metas) = bind_projection_items(&select.projection, exec.schema())?;
-        // Attach ORDER BY before projection if ORDER BY references columns not in SELECT,
-        // or after projection if referencing output aliases. Here we bind ORDER BY against
-        // projection output first, falling back to pre-projection columns.
         if let Some(order_by) = &query.order_by {
             let order_specs = extract_order_specs(order_by)?;
             let can_bind_post = order_specs
@@ -213,8 +258,7 @@ fn build_select_pipeline<T: KvTransaction>(
                             Box::new(TopNSortExec::new(exec, Vec::new(), offset, limit, *config));
                     }
                 }
-                plan_lines.reverse();
-                return Ok((exec, plan_lines));
+                return Ok(exec);
             }
         }
 
@@ -252,9 +296,7 @@ fn build_select_pipeline<T: KvTransaction>(
         ));
     }
 
-    // Present EXPLAIN top-down (root operator first).
-    plan_lines.reverse();
-    Ok((exec, plan_lines))
+    Ok(exec)
 }
 
 fn plan_and_scan_table<T: KvTransaction>(

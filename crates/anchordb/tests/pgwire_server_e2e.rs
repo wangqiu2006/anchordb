@@ -277,20 +277,25 @@ fn pgwire_simple_extended_pg_catalog_and_auth_e2e() {
         vec![vec![Some("Keyboard".into()), Some("399".into())]]
     );
 
-    // Introspect via `pg_catalog.pg_class` and `information_schema.columns`.
+    // Introspect via `pg_catalog.pg_class` and `information_schema.columns` with exact column projection.
     let (pg_class_rows, _, _) = client
-        .simple_query("SELECT relname FROM pg_catalog.pg_class;")
+        .simple_query("SELECT relname FROM pg_catalog.pg_class WHERE relkind = 'r';")
         .unwrap();
-    assert!(
-        pg_class_rows
-            .iter()
-            .any(|r| r.get(1).and_then(Option::as_deref) == Some("products"))
-    );
+    assert_eq!(pg_class_rows, vec![vec![Some("products".into())]]);
 
     let (info_cols, _, _) = client
-        .simple_query("SELECT column_name FROM information_schema.columns;")
+        .simple_query(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'products' ORDER BY ordinal_position ASC;",
+        )
         .unwrap();
-    assert_eq!(info_cols.len(), 3);
+    assert_eq!(
+        info_cols,
+        vec![
+            vec![Some("id".into())],
+            vec![Some("name".into())],
+            vec![Some("price".into())],
+        ]
+    );
 
     client.terminate().unwrap();
     server.stop();

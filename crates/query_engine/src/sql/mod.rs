@@ -66,6 +66,25 @@ pub fn statement_is_write(stmt: &Statement) -> bool {
     )
 }
 
+/// Executes a `SELECT` SQL string directly over an in-memory virtual table (used by `pg_catalog`
+/// and `information_schema` views so projection, `WHERE`, `ORDER BY`, and `LIMIT` work accurately).
+pub fn execute_sql_on_virtual_table(
+    sql: &str,
+    columns: Vec<crate::chunk::ColumnMeta>,
+    rows: Vec<Vec<Value>>,
+    config: &QueryConfig,
+) -> Result<SqlResult, SqlError> {
+    let stmts = parse_sql(sql)?;
+    match stmts.as_slice() {
+        [Statement::Query(query)] => {
+            select::exec_query_on_virtual_table(query, columns, rows, config)
+        }
+        _ => Err(SqlError::Unsupported(
+            "virtual table execution only supports single SELECT queries".into(),
+        )),
+    }
+}
+
 /// Executes a single non-transaction-control SQL statement inside an existing [`KvTransaction`].
 pub fn execute_statement_in_txn<T: KvTransaction>(
     txn: &mut T,
