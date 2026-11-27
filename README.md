@@ -63,6 +63,11 @@ cargo run -p anchordb -- doctor ./demo.db
 # Start PostgreSQL v3.0 server (binds loopback 127.0.0.1:5432 by default)
 cargo run -p anchordb --features mode-server -- serve ./demo.db --listen 127.0.0.1:5432
 
+# Windows one-click helper scripts (in scripts/)
+scripts\start_server.bat
+scripts\open_shell.bat
+scripts\run_doctor.bat
+
 # Optional password authentication
 cargo run -p anchordb --features mode-server -- serve ./demo.db --listen 127.0.0.1:5432 --password secret
 
