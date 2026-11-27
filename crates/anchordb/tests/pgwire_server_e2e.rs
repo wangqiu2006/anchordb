@@ -140,8 +140,8 @@ impl PgTestClient {
         b.extend_from_slice(&0u16.to_be_bytes()); // result formats
         self.write_msg(b'B', &b)?;
 
-        // Describe statement
-        self.write_msg(b'D', &[b'S', 0])?;
+        // Describe portal ('P') — mirrors pgjdbc / DBeaver exact Extended Query framing.
+        self.write_msg(b'D', &[b'P', 0])?;
 
         // Execute portal
         let mut e = Vec::new();
@@ -154,14 +154,20 @@ impl PgTestClient {
         self.stream.flush()?;
 
         let mut rows = Vec::new();
+        let mut row_desc_count = 0usize;
         loop {
             let (tag, payload) = self.read_msg()?;
             match tag {
+                b'T' => row_desc_count += 1,
                 b'D' => rows.push(parse_data_row(&payload)),
                 b'E' => {
                     return Err(io::Error::other(parse_error_payload(&payload)));
                 }
-                b'Z' => return Ok(rows),
+                b'Z' => {
+                    // pgjdbc strictly forbids duplicate RowDescription packets between Describe('P') and Execute.
+                    assert_eq!(row_desc_count, 1);
+                    return Ok(rows);
+                }
                 _ => {}
             }
         }

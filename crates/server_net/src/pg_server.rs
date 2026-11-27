@@ -105,6 +105,8 @@ struct PreparedStmt {
 #[derive(Debug, Clone)]
 struct BoundPortal {
     resolved_sql: String,
+    described_failed: bool,
+    cached_results: Option<Vec<SqlResult>>,
 }
 
 fn handle_connection<B: SqlBackend>(
@@ -154,22 +156,40 @@ fn handle_connection<B: SqlBackend>(
             }
             b'D' => {
                 // Extended Query: Describe('S' | 'P', name)
-                handle_describe(&mut stream, &payload, &prepared, &portals)?;
+                handle_describe(
+                    &mut stream,
+                    &payload,
+                    &mut session,
+                    &prepared,
+                    &mut portals,
+                    &database_name,
+                    &user_name,
+                )?;
             }
             b'E' => {
                 // Extended Query: Execute(portal_name, max_rows)
+                // Per PostgreSQL v3 protocol, Execute NEVER emits RowDescription ('T');
+                // RowDescription is emitted only by Describe('S') / Describe('P').
                 let portal_name = read_cstring(&payload, 0)
                     .map(|(s, _)| s)
                     .unwrap_or_default();
-                if let Some(portal) = portals.get(&portal_name) {
+                if let Some(portal) = portals.get_mut(&portal_name) {
+                    if portal.described_failed {
+                        continue;
+                    }
                     let sql = portal.resolved_sql.clone();
-                    execute_and_write_results(
-                        &mut stream,
-                        &mut session,
-                        &sql,
-                        &database_name,
-                        &user_name,
-                    )?;
+                    if let Some(cached) = portal.cached_results.take() {
+                        write_sql_results(&mut stream, &sql, cached, false)?;
+                    } else {
+                        execute_and_write_results_opts(
+                            &mut stream,
+                            &mut session,
+                            &sql,
+                            &database_name,
+                            &user_name,
+                            false,
+                        )?;
+                    }
                 } else {
                     write_error_response(
                         &mut stream,
@@ -310,15 +330,16 @@ fn perform_startup(
 
         // Send AuthenticationOk + standard PostgreSQL ParameterStatus set + ReadyForQuery.
         write_auth_ok(stream)?;
-        let version_str = format!("15.0 (AnchorDB {})", env!("CARGO_PKG_VERSION"));
         for (k, v) in [
-            ("server_version", version_str.as_str()),
+            ("server_version", "15.0"),
             ("server_encoding", "UTF8"),
             ("client_encoding", "UTF8"),
             ("standard_conforming_strings", "on"),
             ("DateStyle", "ISO, MDY"),
             ("TimeZone", "UTC"),
             ("integer_datetimes", "on"),
+            ("is_superuser", "on"),
+            ("session_authorization", user.as_str()),
         ] {
             write_parameter_status(stream, k, v)?;
         }
@@ -337,58 +358,86 @@ fn execute_and_write_results<S: ServerSession>(
     database_name: &str,
     user_name: &str,
 ) -> io::Result<()> {
+    execute_and_write_results_opts(stream, session, sql, database_name, user_name, true)
+}
+
+fn run_sql_with_compat<S: ServerSession>(
+    session: &mut S,
+    trimmed_sql: &str,
+    database_name: &str,
+    user_name: &str,
+) -> Result<Vec<SqlResult>, SqlError> {
+    match try_handle_pg_compat(session, trimmed_sql, database_name, user_name)? {
+        Some(results) => Ok(results),
+        None => session.execute(trimmed_sql),
+    }
+}
+
+fn execute_and_write_results_opts<S: ServerSession>(
+    stream: &mut TcpStream,
+    session: &mut S,
+    sql: &str,
+    database_name: &str,
+    user_name: &str,
+    send_row_desc: bool,
+) -> io::Result<()> {
     let trimmed = sql.trim();
     if trimmed.is_empty() {
         write_empty_query_response(stream)?;
         return Ok(());
     }
 
-    let exec_result = match try_handle_pg_compat(session, trimmed, database_name, user_name) {
-        Ok(Some(results)) => Ok(results),
-        Ok(None) => session.execute(trimmed),
-        Err(err) => Err(err),
-    };
-
-    match exec_result {
-        Ok(results) => {
-            if results.is_empty() {
-                write_empty_query_response(stream)?;
-                return Ok(());
-            }
-            for res in results {
-                match res {
-                    SqlResult::Rows { columns, rows } => {
-                        let col_oids: Vec<i32> = (0..columns.len())
-                            .map(|c_idx| {
-                                rows.iter()
-                                    .find_map(|r| {
-                                        r.get(c_idx).filter(|v| !v.is_null()).map(value_to_pg_oid)
-                                    })
-                                    .unwrap_or(OID_TEXT)
-                            })
-                            .collect();
-                        write_row_description(stream, &columns, &col_oids)?;
-                        for row in &rows {
-                            write_data_row(stream, row)?;
-                        }
-                        write_command_complete(stream, &format!("SELECT {}", rows.len()))?;
-                    }
-                    SqlResult::Affected { count } => {
-                        let tag = infer_dml_tag(trimmed, count);
-                        write_command_complete(stream, &tag)?;
-                    }
-                    SqlResult::Message(msg) => {
-                        write_command_complete(stream, &msg)?;
-                    }
-                }
-            }
-        }
+    match run_sql_with_compat(session, trimmed, database_name, user_name) {
+        Ok(results) => write_sql_results(stream, trimmed, results, send_row_desc),
         Err(err) => {
             let code = sql_error_to_pg_state(&err);
-            write_error_response(stream, code, &err.to_string())?;
+            write_error_response(stream, code, &err.to_string())
+        }
+    }
+}
+
+fn write_sql_results(
+    stream: &mut TcpStream,
+    trimmed_sql: &str,
+    results: Vec<SqlResult>,
+    send_row_desc: bool,
+) -> io::Result<()> {
+    if results.is_empty() {
+        write_empty_query_response(stream)?;
+        return Ok(());
+    }
+    for res in results {
+        match res {
+            SqlResult::Rows { columns, rows } => {
+                if send_row_desc {
+                    let col_oids = infer_column_oids(&columns, &rows);
+                    write_row_description(stream, &columns, &col_oids)?;
+                }
+                for row in &rows {
+                    write_data_row(stream, row)?;
+                }
+                write_command_complete(stream, &format!("SELECT {}", rows.len()))?;
+            }
+            SqlResult::Affected { count } => {
+                let tag = infer_dml_tag(trimmed_sql, count);
+                write_command_complete(stream, &tag)?;
+            }
+            SqlResult::Message(msg) => {
+                write_command_complete(stream, &msg)?;
+            }
         }
     }
     Ok(())
+}
+
+fn infer_column_oids(columns: &[String], rows: &[Vec<table_codec::Value>]) -> Vec<i32> {
+    (0..columns.len())
+        .map(|c_idx| {
+            rows.iter()
+                .find_map(|r| r.get(c_idx).filter(|v| !v.is_null()).map(value_to_pg_oid))
+                .unwrap_or(OID_TEXT)
+        })
+        .collect()
 }
 
 fn infer_dml_tag(sql: &str, count: usize) -> String {
@@ -487,15 +536,25 @@ fn handle_bind(
     }
 
     let resolved_sql = substitute_dollar_params(&stmt.sql, &params);
-    portals.insert(portal_name, BoundPortal { resolved_sql });
+    portals.insert(
+        portal_name,
+        BoundPortal {
+            resolved_sql,
+            described_failed: false,
+            cached_results: None,
+        },
+    );
     Ok(())
 }
 
-fn handle_describe(
+fn handle_describe<S: ServerSession>(
     stream: &mut TcpStream,
     payload: &[u8],
+    session: &mut S,
     prepared: &HashMap<String, PreparedStmt>,
-    portals: &HashMap<String, BoundPortal>,
+    portals: &mut HashMap<String, BoundPortal>,
+    database_name: &str,
+    user_name: &str,
 ) -> io::Result<()> {
     let Some(&kind) = payload.first() else {
         write_error_response(stream, "08P01", "malformed Describe message")?;
@@ -506,7 +565,24 @@ fn handle_describe(
         b'S' => {
             if let Some(stmt) = prepared.get(&name) {
                 write_parameter_description(stream, stmt.param_count)?;
-                write_simple_tag(stream, b'n')?; // NoData until Execute delivers exact RowDescription
+                let trimmed = stmt.sql.trim();
+                if is_read_only_sql(trimmed) {
+                    let probe_sql = if stmt.param_count > 0 {
+                        let nulls = vec![None; stmt.param_count];
+                        substitute_dollar_params(trimmed, &nulls)
+                    } else {
+                        trimmed.to_owned()
+                    };
+                    if let Ok(results) =
+                        run_sql_with_compat(session, &probe_sql, database_name, user_name)
+                        && let Some(SqlResult::Rows { columns, rows }) = results.first()
+                    {
+                        let oids = infer_column_oids(columns, rows);
+                        write_row_description(stream, columns, &oids)?;
+                        return Ok(());
+                    }
+                }
+                write_simple_tag(stream, b'n')?;
             } else {
                 write_error_response(
                     stream,
@@ -516,10 +592,33 @@ fn handle_describe(
             }
         }
         b'P' => {
-            if portals.contains_key(&name) {
-                write_simple_tag(stream, b'n')?;
-            } else {
+            let Some(portal) = portals.get_mut(&name) else {
                 write_error_response(stream, "34000", &format!("portal '{name}' does not exist"))?;
+                return Ok(());
+            };
+            let trimmed = portal.resolved_sql.trim();
+            if trimmed.is_empty() {
+                write_simple_tag(stream, b'n')?;
+                return Ok(());
+            }
+            // Per PostgreSQL v3 Extended Query spec (strictly enforced by pgjdbc/DBeaver):
+            // Describe('P') MUST send RowDescription ('T') for row-returning portals and
+            // Execute('E') MUST NOT resend RowDescription.
+            match run_sql_with_compat(session, trimmed, database_name, user_name) {
+                Ok(results) => {
+                    if let Some(SqlResult::Rows { columns, rows }) = results.first() {
+                        let oids = infer_column_oids(columns, rows);
+                        write_row_description(stream, columns, &oids)?;
+                    } else {
+                        write_simple_tag(stream, b'n')?;
+                    }
+                    portal.cached_results = Some(results);
+                }
+                Err(err) => {
+                    portal.described_failed = true;
+                    let code = sql_error_to_pg_state(&err);
+                    write_error_response(stream, code, &err.to_string())?;
+                }
             }
         }
         _ => {
@@ -527,6 +626,11 @@ fn handle_describe(
         }
     }
     Ok(())
+}
+
+fn is_read_only_sql(trimmed: &str) -> bool {
+    let lower = trimmed.to_lowercase();
+    lower.starts_with("select") || lower.starts_with("show") || lower.starts_with("explain")
 }
 
 fn count_dollar_params(sql: &str) -> usize {

@@ -113,6 +113,27 @@ pub fn try_handle_pg_compat<S: ServerSession>(
             virtual_pg_namespace(),
         )]));
     }
+    if lower.contains("pg_database") {
+        return Ok(Some(vec![run_virtual_query(
+            trimmed,
+            "pg_database",
+            virtual_pg_database(database_name),
+        )]));
+    }
+    if lower.contains("pg_roles") || lower.contains("pg_user") || lower.contains("pg_authid") {
+        return Ok(Some(vec![run_virtual_query(
+            trimmed,
+            "pg_roles",
+            virtual_pg_roles(user_name),
+        )]));
+    }
+    if lower.contains("pg_settings") {
+        return Ok(Some(vec![run_virtual_query(
+            trimmed,
+            "pg_settings",
+            virtual_pg_settings(),
+        )]));
+    }
     if lower.contains("pg_type") {
         return Ok(Some(vec![run_virtual_query(
             trimmed,
@@ -219,15 +240,81 @@ fn handle_scalar_pg_probe(lower: &str, database_name: &str, user_name: &str) -> 
 
 fn virtual_pg_namespace() -> SqlResult {
     SqlResult::Rows {
-        columns: vec!["oid".into(), "nspname".into()],
+        columns: vec!["oid".into(), "nspname".into(), "nspowner".into()],
         rows: vec![
             vec![
                 Value::Int64(PG_CATALOG_NAMESPACE_OID),
                 Value::Text("pg_catalog".into()),
+                Value::Int64(10),
             ],
             vec![
                 Value::Int64(PUBLIC_NAMESPACE_OID),
                 Value::Text("public".into()),
+                Value::Int64(10),
+            ],
+        ],
+    }
+}
+
+fn virtual_pg_database(database_name: &str) -> SqlResult {
+    SqlResult::Rows {
+        columns: vec![
+            "oid".into(),
+            "datname".into(),
+            "datdba".into(),
+            "encoding".into(),
+            "datistemplate".into(),
+            "datallowconn".into(),
+        ],
+        rows: vec![vec![
+            Value::Int64(16384),
+            Value::Text(database_name.to_owned()),
+            Value::Int64(10),
+            Value::Int64(6), // UTF8
+            Value::Bool(false),
+            Value::Bool(true),
+        ]],
+    }
+}
+
+fn virtual_pg_roles(user_name: &str) -> SqlResult {
+    SqlResult::Rows {
+        columns: vec![
+            "oid".into(),
+            "rolname".into(),
+            "rolsuper".into(),
+            "rolcanlogin".into(),
+            "usename".into(),
+        ],
+        rows: vec![vec![
+            Value::Int64(10),
+            Value::Text(user_name.to_owned()),
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Text(user_name.to_owned()),
+        ]],
+    }
+}
+
+fn virtual_pg_settings() -> SqlResult {
+    SqlResult::Rows {
+        columns: vec!["name".into(), "setting".into()],
+        rows: vec![
+            vec![
+                Value::Text("server_version".into()),
+                Value::Text("15.0".into()),
+            ],
+            vec![
+                Value::Text("server_version_num".into()),
+                Value::Text("150000".into()),
+            ],
+            vec![
+                Value::Text("server_encoding".into()),
+                Value::Text("UTF8".into()),
+            ],
+            vec![
+                Value::Text("standard_conforming_strings".into()),
+                Value::Text("on".into()),
             ],
         ],
     }
