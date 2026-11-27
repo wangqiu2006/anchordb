@@ -34,5 +34,8 @@ table_codec = { path = "../table_codec", optional = true }
 query_engine = { path = "../query_engine", optional = true }
 server_net = { path = "../server_net", optional = true }
 
+[dev-dependencies]
+sqllogictest = "0.29"
+
 [lints]
 workspace = true

@@ -1,0 +1,114 @@
+# Phase 4A sqllogictest suite 03: INNER/LEFT JOINs, GROUP BY / HAVING aggregates,
+# Empty-table global aggregates, explicit transactions, and multi-connection Snapshot Isolation.
+
+statement ok
+CREATE TABLE departments (
+    id BIGINT PRIMARY KEY,
+    dept_name TEXT NOT NULL
+);
+
+statement ok
+CREATE TABLE employees (
+    id BIGINT PRIMARY KEY,
+    dept_id BIGINT NOT NULL,
+    emp_name TEXT NOT NULL,
+    salary BIGINT NOT NULL
+);
+
+# Empty-table global aggregate semantics
+query II
+SELECT COUNT(*), SUM(salary) FROM employees;
+----
+0 NULL
+
+statement ok
+INSERT INTO departments VALUES (1, 'Engine'), (2, 'Query'), (3, 'Research');
+
+statement ok
+INSERT INTO employees VALUES
+    (10, 1, 'Alice', 100),
+    (11, 1, 'Bob', 140),
+    (12, 2, 'Carol', 120),
+    (13, 2, 'Dave', 80);
+
+# INNER JOIN + GROUP BY + HAVING + ORDER BY
+query TIIII
+SELECT d.dept_name, COUNT(*) AS cnt, SUM(e.salary) AS total, MIN(e.salary) AS lo, MAX(e.salary) AS hi
+FROM departments d
+INNER JOIN employees e ON d.id = e.dept_id
+GROUP BY d.dept_name
+HAVING SUM(e.salary) >= 200
+ORDER BY d.dept_name ASC;
+----
+Engine 2 240 100 140
+Query 2 200 80 120
+
+# LEFT JOIN preserves department with zero employees (Research -> NULL)
+query TT
+SELECT d.dept_name, e.emp_name
+FROM departments d
+LEFT JOIN employees e ON d.id = e.dept_id
+WHERE d.id = 3;
+----
+Research NULL
+
+# Explicit BEGIN ... ROLLBACK leaves database untouched
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO employees VALUES (99, 3, 'Temp', 50);
+
+query I
+SELECT COUNT(*) FROM employees;
+----
+5
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT COUNT(*) FROM employees;
+----
+4
+
+# Multi-connection Snapshot Isolation & First-Committer-Wins write-write conflict
+connection c1
+statement ok
+BEGIN;
+
+connection c2
+statement ok
+BEGIN;
+
+connection c1
+statement ok
+UPDATE employees SET salary = 150 WHERE id = 10;
+
+# c2 must still see its snapshot (salary = 100) while c1 is uncommitted
+connection c2
+query I
+SELECT salary FROM employees WHERE id = 10;
+----
+100
+
+connection c2
+statement ok
+UPDATE employees SET salary = 160 WHERE id = 10;
+
+# c1 commits first -> succeeds
+connection c1
+statement ok
+COMMIT;
+
+# c2 attempts to commit conflicting write on id = 10 -> rejected by First-Committer-Wins!
+connection c2
+statement error
+COMMIT;
+
+# Final committed value is c1's 150
+connection c1
+query I
+SELECT salary FROM employees WHERE id = 10;
+----
+150

@@ -1,0 +1,92 @@
+# Phase 4A sqllogictest suite 01: Basic CRUD, Types, NULL three-valued logic,
+# Predicates (LIKE, IN, AND/OR/NOT), DISTINCT, ORDER BY, LIMIT/OFFSET.
+
+statement ok
+CREATE TABLE items (
+    id BIGINT PRIMARY KEY,
+    name TEXT NOT NULL,
+    category TEXT DEFAULT 'misc',
+    price BIGINT,
+    in_stock BOOLEAN NOT NULL DEFAULT true
+);
+
+statement ok
+INSERT INTO items (id, name, category, price, in_stock) VALUES
+    (1, 'Sword', 'weapon', 120, true),
+    (2, 'Shield', 'armor', 90, true),
+    (3, 'Elixir', 'potion', NULL, false),
+    (4, 'Dagger', 'weapon', 60, true),
+    (5, 'Helm', 'armor', 150, false);
+
+# Column-list INSERT using DEFAULT values
+statement ok
+INSERT INTO items (id, name, price) VALUES (6, 'Torch', 15);
+
+# Duplicate primary key must fail
+statement error
+INSERT INTO items (id, name, category, price, in_stock) VALUES (1, 'Dup', 'weapon', 10, true);
+
+# Basic ORDER BY + LIMIT + OFFSET
+query ITTIT
+SELECT id, name, category, price, in_stock FROM items ORDER BY id ASC LIMIT 3 OFFSET 1;
+----
+2 Shield armor 90 true
+3 Elixir potion NULL false
+4 Dagger weapon 60 true
+
+# NULL three-valued logic: `price = NULL` must yield 0 rows; `IS NULL` matches Elixir
+query IT
+SELECT id, name FROM items WHERE price = NULL;
+----
+
+query IT
+SELECT id, name FROM items WHERE price IS NULL;
+----
+3 Elixir
+
+query IT
+SELECT id, name FROM items WHERE price IS NOT NULL AND price >= 120 ORDER BY price DESC;
+----
+5 Helm
+1 Sword
+
+# LIKE pattern matching (`%` and `_`) and IN list
+query IT
+SELECT id, name FROM items WHERE name LIKE 'S%' OR name LIKE '____' ORDER BY id ASC;
+----
+1 Sword
+2 Shield
+5 Helm
+
+query IT
+SELECT id, name FROM items WHERE category IN ('potion', 'misc') ORDER BY id ASC;
+----
+3 Elixir
+6 Torch
+
+# DISTINCT categories sorted alphabetically
+query T
+SELECT DISTINCT category FROM items ORDER BY category ASC;
+----
+armor
+misc
+potion
+weapon
+
+# Arithmetic projection + UPDATE + DELETE
+statement ok
+UPDATE items SET price = price + 30 WHERE category = 'weapon';
+
+query II
+SELECT id, price FROM items WHERE category = 'weapon' ORDER BY id ASC;
+----
+1 150
+4 90
+
+statement ok
+DELETE FROM items WHERE in_stock = false;
+
+query I
+SELECT COUNT(*) FROM items;
+----
+4

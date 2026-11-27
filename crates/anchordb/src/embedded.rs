@@ -9,7 +9,7 @@ use std::vec::Vec;
 use hal_vfs::FileSystem;
 use hal_vfs::std_fs::StdFileSystem;
 use kv_core::{
-    DoctorReport, KvEngine, KvError, KvTransaction, LsmConfig, LsmEngine, LsmTxn, inspect_database,
+    DoctorReport, KvEngine, KvError, KvTransaction, LsmConfig, LsmEngine, inspect_database,
 };
 use query_engine::{
     Expr, QueryConfig, QueryError, QueryPlan, QueryRow, SqlError, SqlResult, TableQuery,
@@ -67,13 +67,13 @@ impl From<SqlError> for DbError {
 }
 
 /// Embedded AnchorDB handle supporting transactional CRUD, schema evolution, structured queries,
-/// and embedded SQL execution.
-pub struct AnchorDb<F: FileSystem = StdFileSystem> {
-    engine: LsmEngine<F>,
+/// and embedded SQL execution over any [`KvEngine`] implementation.
+pub struct AnchorDb<E: KvEngine = LsmEngine<StdFileSystem>> {
+    engine: E,
     query_config: QueryConfig,
 }
 
-impl AnchorDb<StdFileSystem> {
+impl AnchorDb<LsmEngine<StdFileSystem>> {
     /// Opens or creates a local embedded database at `path` using default settings.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
         Self::open_with_config(path, LsmConfig::default(), QueryConfig::default())
@@ -96,22 +96,44 @@ impl AnchorDb<StdFileSystem> {
     }
 }
 
-impl<F: FileSystem> AnchorDb<F> {
-    /// Opens an [`AnchorDb`] over any custom [`FileSystem`] (such as `FaultSimFs` for crash tests).
+impl<F: FileSystem> AnchorDb<LsmEngine<F>> {
+    /// Opens an [`AnchorDb`] backed by [`LsmEngine`] over any custom [`FileSystem`]
+    /// (such as `FaultSimFs` for deterministic crash tests).
     pub fn open_fs(
         fs: F,
         lsm_config: LsmConfig,
         query_config: QueryConfig,
     ) -> Result<Self, DbError> {
         let engine = LsmEngine::open(fs, lsm_config)?;
-        Ok(Self {
+        Ok(Self::from_engine(engine, query_config))
+    }
+
+    /// Triggers a full LSM compaction across all active SSTables.
+    pub fn compact_all(&self) -> Result<(), DbError> {
+        self.engine.compact_all()?;
+        Ok(())
+    }
+}
+
+impl<E: KvEngine> AnchorDb<E> {
+    /// Wraps any [`KvEngine`] implementation (LSM-Tree, in-memory mock, custom Flash engine, etc.)
+    /// into a full relational & SQL [`AnchorDb`] handle.
+    #[must_use]
+    pub const fn from_engine(engine: E, query_config: QueryConfig) -> Self {
+        Self {
             engine,
             query_config,
-        })
+        }
+    }
+
+    /// Borrows the underlying [`KvEngine`].
+    #[must_use]
+    pub const fn engine(&self) -> &E {
+        &self.engine
     }
 
     /// Begins an explicit multi-statement transaction with Snapshot Isolation.
-    pub fn begin_txn(&self, read_only: bool) -> Result<DbTxn<'_, F>, DbError> {
+    pub fn begin_txn(&self, read_only: bool) -> Result<DbTxn<'_, E>, DbError> {
         let txn = self.engine.begin_txn(read_only)?;
         Ok(DbTxn {
             txn,
@@ -121,7 +143,7 @@ impl<F: FileSystem> AnchorDb<F> {
 
     /// Opens a stateful SQL session supporting `BEGIN` / `COMMIT` / `ROLLBACK` across statements.
     #[must_use]
-    pub fn sql_session(&self) -> SqlSession<'_, F> {
+    pub fn sql_session(&self) -> SqlSession<'_, E> {
         SqlSession {
             db: self,
             active_txn: None,
@@ -138,7 +160,7 @@ impl<F: FileSystem> AnchorDb<F> {
     /// Starts a chainable structured query against `table_name`:
     /// `db.table("items").filter(col("rarity").gte(4)).order_by("level", SortOrder::Desc).limit(20).collect()`
     #[must_use]
-    pub fn table(&self, table_name: impl Into<String>) -> TableQueryHandle<'_, F> {
+    pub fn table(&self, table_name: impl Into<String>) -> TableQueryHandle<'_, E> {
         TableQueryHandle {
             db: self,
             query: TableQuery::new(table_name),
@@ -225,21 +247,16 @@ impl<F: FileSystem> AnchorDb<F> {
         self.engine.checkpoint()?;
         Ok(())
     }
-
-    pub fn compact_all(&self) -> Result<(), DbError> {
-        self.engine.compact_all()?;
-        Ok(())
-    }
 }
 
 /// Stateful SQL session supporting explicit `BEGIN` / `COMMIT` / `ROLLBACK` transactions
 /// as well as auto-commit statements.
-pub struct SqlSession<'a, F: FileSystem> {
-    db: &'a AnchorDb<F>,
-    active_txn: Option<LsmTxn<'a, F>>,
+pub struct SqlSession<'a, E: KvEngine + 'a = LsmEngine<StdFileSystem>> {
+    db: &'a AnchorDb<E>,
+    active_txn: Option<E::Txn<'a>>,
 }
 
-impl<F: FileSystem> SqlSession<'_, F> {
+impl<'a, E: KvEngine + 'a> SqlSession<'a, E> {
     #[must_use]
     pub const fn in_transaction(&self) -> bool {
         self.active_txn.is_some()
@@ -324,12 +341,12 @@ impl<F: FileSystem> SqlSession<'_, F> {
 }
 
 /// Explicit multi-statement transaction handle over [`AnchorDb`].
-pub struct DbTxn<'a, F: FileSystem> {
-    txn: LsmTxn<'a, F>,
+pub struct DbTxn<'a, E: KvEngine + 'a = LsmEngine<StdFileSystem>> {
+    txn: E::Txn<'a>,
     query_config: QueryConfig,
 }
 
-impl<F: FileSystem> DbTxn<'_, F> {
+impl<'a, E: KvEngine + 'a> DbTxn<'a, E> {
     pub fn create_table(
         &mut self,
         name: &str,
@@ -442,12 +459,12 @@ impl<F: FileSystem> DbTxn<'_, F> {
 }
 
 /// Fluent chainable query handle returned by [`AnchorDb::table`].
-pub struct TableQueryHandle<'a, F: FileSystem> {
-    db: &'a AnchorDb<F>,
+pub struct TableQueryHandle<'a, E: KvEngine = LsmEngine<StdFileSystem>> {
+    db: &'a AnchorDb<E>,
     query: TableQuery,
 }
 
-impl<F: FileSystem> TableQueryHandle<'_, F> {
+impl<E: KvEngine> TableQueryHandle<'_, E> {
     #[must_use]
     pub fn select(mut self, columns: &[&str]) -> Self {
         self.query = self.query.select(columns);

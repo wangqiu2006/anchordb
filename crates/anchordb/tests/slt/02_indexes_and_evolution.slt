@@ -1,0 +1,82 @@
+# Phase 4A sqllogictest suite 02: Composite ASC/DESC Secondary Indexes, UNIQUE Indexes
+# with NULL semantics, IndexScan vs SeqScan correctness oracle, and Online Schema Evolution.
+
+statement ok
+CREATE TABLE players (
+    id BIGINT PRIMARY KEY,
+    guild TEXT NOT NULL,
+    score BIGINT NOT NULL,
+    email TEXT
+);
+
+statement ok
+INSERT INTO players VALUES
+    (1, 'Alpha', 500, 'a1@example.com'),
+    (2, 'Beta', 700, NULL),
+    (3, 'Alpha', 900, 'a3@example.com'),
+    (4, 'Alpha', 300, NULL),
+    (5, 'Gamma', 850, 'g5@example.com'),
+    (6, 'Beta', 400, 'b6@example.com');
+
+# Baseline SeqScan result before creating composite index (Correctness Oracle)
+query ITI
+SELECT id, guild, score FROM players WHERE guild = 'Alpha' AND score >= 400 ORDER BY score DESC;
+----
+3 Alpha 900
+1 Alpha 500
+
+# Create composite secondary index (guild ASC, score DESC) and UNIQUE index on nullable email
+statement ok
+CREATE INDEX idx_guild_score ON players (guild ASC, score DESC);
+
+statement ok
+CREATE UNIQUE INDEX idx_players_email ON players (email ASC);
+
+# Indexed scan must return byte-for-byte identical rows to SeqScan baseline
+query ITI
+SELECT id, guild, score FROM players WHERE guild = 'Alpha' AND score >= 400 ORDER BY score DESC;
+----
+3 Alpha 900
+1 Alpha 500
+
+# UNIQUE index must reject duplicate non-NULL emails
+statement error
+INSERT INTO players VALUES (7, 'Gamma', 100, 'a1@example.com');
+
+# UNIQUE index must allow multiple NULL emails (SQL standard)
+statement ok
+INSERT INTO players VALUES (7, 'Gamma', 100, NULL);
+
+query I
+SELECT COUNT(*) FROM players WHERE email IS NULL;
+----
+3
+
+# Online schema evolution: ADD COLUMN with frozen DEFAULT + DROP COLUMN
+statement ok
+ALTER TABLE players ADD COLUMN tier TEXT NOT NULL DEFAULT 'bronze';
+
+statement ok
+UPDATE players SET tier = 'gold' WHERE score >= 800;
+
+query ITT
+SELECT id, guild, tier FROM players WHERE tier = 'gold' ORDER BY id ASC;
+----
+3 Alpha gold
+5 Gamma gold
+
+# Dropping a column referenced by an active secondary index must be rejected
+statement error
+ALTER TABLE players DROP COLUMN email;
+
+# Online ADD + DROP of a non-indexed column succeeds while preserving historical rows
+statement ok
+ALTER TABLE players ADD COLUMN temp_note TEXT DEFAULT 'n/a';
+
+statement ok
+ALTER TABLE players DROP COLUMN temp_note;
+
+query ITITT
+SELECT id, guild, score, email, tier FROM players WHERE id = 2;
+----
+2 Beta 700 NULL bronze

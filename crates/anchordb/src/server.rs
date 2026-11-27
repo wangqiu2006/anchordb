@@ -4,7 +4,7 @@ use std::io;
 use std::sync::Arc;
 use std::vec::Vec;
 
-use hal_vfs::FileSystem;
+use kv_core::KvEngine;
 use query_engine::{SqlError, SqlResult};
 use server_net::{PgServer, ServerConfig, ServerSession, SqlBackend};
 use table_codec::TableSchema;
@@ -20,10 +20,9 @@ fn map_db_err(err: DbError) -> SqlError {
     }
 }
 
-impl<F: FileSystem + Send + Sync + 'static> ServerSession for SqlSession<'_, F>
+impl<'a, E: KvEngine + Send + Sync + 'static> ServerSession for SqlSession<'a, E>
 where
-    F::File: Send + Sync,
-    F::Lock: Send + Sync,
+    E::Txn<'a>: Send,
 {
     fn in_transaction(&self) -> bool {
         SqlSession::in_transaction(self)
@@ -42,13 +41,12 @@ where
     }
 }
 
-impl<F: FileSystem + Send + Sync + 'static> SqlBackend for AnchorDb<F>
+impl<E: KvEngine + Send + Sync + 'static> SqlBackend for AnchorDb<E>
 where
-    F::File: Send + Sync,
-    F::Lock: Send + Sync,
+    for<'a> E::Txn<'a>: Send,
 {
     type Session<'a>
-        = SqlSession<'a, F>
+        = SqlSession<'a, E>
     where
         Self: 'a;
 
@@ -57,14 +55,13 @@ where
     }
 }
 
-/// Starts a PostgreSQL v3.0 TCP server backed by `db`.
-pub fn start_pg_server<F: FileSystem + Send + Sync + 'static>(
-    db: Arc<AnchorDb<F>>,
+/// Starts a PostgreSQL v3.0 TCP server backed by any [`KvEngine`]-powered [`AnchorDb`].
+pub fn start_pg_server<E: KvEngine + Send + Sync + 'static>(
+    db: Arc<AnchorDb<E>>,
     config: ServerConfig,
 ) -> io::Result<PgServer>
 where
-    F::File: Send + Sync,
-    F::Lock: Send + Sync,
+    for<'a> E::Txn<'a>: Send,
 {
     PgServer::start(db, config)
 }

@@ -15,5 +15,12 @@ mvcc = ["std"]
 [dependencies]
 hal_vfs = { path = "../hal_vfs", default-features = false }
 
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false }
+
+[[bench]]
+name = "kv_bench"
+harness = false
+
 [lints]
 workspace = true

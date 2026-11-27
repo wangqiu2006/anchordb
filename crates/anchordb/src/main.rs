@@ -214,10 +214,7 @@ fn run_shell(db_path: &str, version: &str, profile: &str) {
     }
 }
 
-fn execute_and_print(
-    session: &mut anchordb::SqlSession<'_, hal_vfs::std_fs::StdFileSystem>,
-    sql: &str,
-) {
+fn execute_and_print(session: &mut anchordb::SqlSession<'_>, sql: &str) {
     match session.execute(sql) {
         Ok(results) => {
             for res in results {

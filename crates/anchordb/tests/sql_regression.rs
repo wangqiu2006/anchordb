@@ -10,10 +10,12 @@
 //! - Interactive `anchordb shell` piped execution end-to-end
 
 use anchordb::hal_vfs::fault_sim::FaultSimFs;
-use anchordb::kv_core::LsmConfig;
+use anchordb::kv_core::{LsmConfig, LsmEngine};
 use anchordb::{AnchorDb, QueryConfig, SqlResult, Value, format_sql_result};
 
-fn new_test_db(seed: u64) -> Result<(FaultSimFs, AnchorDb<FaultSimFs>), anchordb::DbError> {
+type SimDb = AnchorDb<LsmEngine<FaultSimFs>>;
+
+fn new_test_db(seed: u64) -> Result<(FaultSimFs, SimDb), anchordb::DbError> {
     let fs = FaultSimFs::new(seed);
     let lsm = LsmConfig {
         memtable_flush_bytes: 512,
@@ -26,7 +28,7 @@ fn new_test_db(seed: u64) -> Result<(FaultSimFs, AnchorDb<FaultSimFs>), anchordb
     Ok((fs, db))
 }
 
-fn query_rows(db: &AnchorDb<FaultSimFs>, sql: &str) -> Result<Vec<Vec<Value>>, anchordb::DbError> {
+fn query_rows(db: &SimDb, sql: &str) -> Result<Vec<Vec<Value>>, anchordb::DbError> {
     let mut results = db.execute_sql(sql)?;
     match results.pop() {
         Some(SqlResult::Rows { rows, .. }) => Ok(rows),
