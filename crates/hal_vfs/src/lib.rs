@@ -3,6 +3,12 @@
 #[cfg(feature = "std")]
 extern crate std;
 
+#[cfg(feature = "std")]
+pub mod fault_sim;
+pub mod mcu_flash;
+#[cfg(feature = "std")]
+pub mod std_fs;
+
 use core::fmt;
 
 /// Unified storage and filesystem error codes across host OS, MCU flash, and fault simulators.
@@ -10,6 +16,8 @@ use core::fmt;
 pub enum VfsError {
     NotFound,
     AlreadyLocked,
+    InvalidName,
+    InvalidAlignment,
     IoFailure,
     CorruptedData,
     NoSpace,
@@ -21,6 +29,8 @@ impl fmt::Display for VfsError {
         let msg = match self {
             Self::NotFound => "storage entry not found",
             Self::AlreadyLocked => "storage directory is already exclusively locked",
+            Self::InvalidName => "invalid storage file name",
+            Self::InvalidAlignment => "flash offset or length violates hardware alignment",
             Self::IoFailure => "underlying storage I/O failure",
             Self::CorruptedData => "corrupted storage data detected",
             Self::NoSpace => "no space left on storage device",
@@ -31,6 +41,20 @@ impl fmt::Display for VfsError {
 }
 
 impl core::error::Error for VfsError {}
+
+/// Validates a flat logical file name (prevents empty names, separators, and path traversal).
+pub fn validate_file_name(name: &str) -> Result<(), VfsError> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err(VfsError::InvalidName);
+    }
+    Ok(())
+}
 
 /// Byte-addressable persistent file or logical volume abstraction (WAL, SSTable, Manifest).
 pub trait StorageFile {
@@ -55,6 +79,7 @@ pub trait FileSystem {
     type Lock: FileLock;
 
     fn lock_exclusive(&self, name: &str) -> Result<Self::Lock, VfsError>;
+    fn exists(&self, name: &str) -> Result<bool, VfsError>;
     fn open_or_create(&self, name: &str) -> Result<Self::File, VfsError>;
     fn open_read_only(&self, name: &str) -> Result<Self::File, VfsError>;
     fn remove(&self, name: &str) -> Result<(), VfsError>;
@@ -66,13 +91,15 @@ pub trait FileSystem {
 
 #[cfg(test)]
 mod tests {
-    use super::VfsError;
+    use super::{VfsError, validate_file_name};
 
     #[test]
     fn vfs_error_display_is_non_empty() {
         let errors = [
             VfsError::NotFound,
             VfsError::AlreadyLocked,
+            VfsError::InvalidName,
+            VfsError::InvalidAlignment,
             VfsError::IoFailure,
             VfsError::CorruptedData,
             VfsError::NoSpace,
@@ -81,5 +108,15 @@ mod tests {
         for err in errors {
             assert!(!std::format!("{err}").is_empty());
         }
+    }
+
+    #[test]
+    fn file_name_validation_rejects_traversal() {
+        assert_eq!(validate_file_name("wal-0001.log"), Ok(()));
+        assert_eq!(validate_file_name(""), Err(VfsError::InvalidName));
+        assert_eq!(validate_file_name("."), Err(VfsError::InvalidName));
+        assert_eq!(validate_file_name(".."), Err(VfsError::InvalidName));
+        assert_eq!(validate_file_name("../escape"), Err(VfsError::InvalidName));
+        assert_eq!(validate_file_name("dir\\file"), Err(VfsError::InvalidName));
     }
 }
