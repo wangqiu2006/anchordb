@@ -43,5 +43,6 @@ dependencies = [
 name = "table_codec"
 version = "0.1.0"
 dependencies = [
+ "hal_vfs",
  "kv_core",
 ]

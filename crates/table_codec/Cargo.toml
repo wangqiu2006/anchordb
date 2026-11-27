@@ -12,5 +12,8 @@ std = ["kv_core/std"]
 [dependencies]
 kv_core = { path = "../kv_core", default-features = false, features = ["alloc"] }
 
+[dev-dependencies]
+hal_vfs = { path = "../hal_vfs" }
+
 [lints]
 workspace = true
